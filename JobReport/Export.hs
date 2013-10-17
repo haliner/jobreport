@@ -126,16 +126,17 @@ buildWorking (ReportWorking (y, m) js) = header 3 t
          , plain $ text "Stunden"
          , plain $ text "Gehalt"
          ]
-    (rs, Sum s) = runWriter $ mapM buildWorkingRows js
+    (rs, (Sum d, Sum s)) = runWriter $ mapM buildWorkingRows js
     lr = map (plain . text)
-        [ "Summe", "", ""
+        [ "Summe", ""
+        , printf "%.1f h" d
         , printf "%.2f €" s
         ]
     rs' = rs ++ [lr]
 
-buildWorkingRows :: (Job, Working) -> Writer (Sum Double) [Blocks]
+buildWorkingRows :: (Job, Working) -> Writer (Sum Double, Sum Double) [Blocks]
 buildWorkingRows (j, w) = do
-    tell $ Sum salary
+    tell (Sum duration, Sum salary)
     return $ map (plain . text) [col1, col2, col3, col4]
   where
     start = fromIntegral (workingStartHour w * 60 + workingStartMinute w)
