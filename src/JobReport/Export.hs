@@ -1,151 +1,111 @@
 module JobReport.Export where
 
-import Control.Monad
-import Control.Monad.Trans.Writer.Strict
-
 import Data.Functor
-import Data.Maybe
+import Data.List
 import Data.Monoid
 
-import Database.Esqueleto
+import Database.HDBC
+import Database.HDBC.Sqlite3
 
 import JobReport.Database
 
-import Text.Pandoc hiding (Writer)
+import Text.Pandoc
 import Text.Pandoc.Builder
-import Text.Printf
 
-data ReportPayment = ReportPayment Job [(Payment, Int)]
-data ReportWorking = ReportWorking (Int, Int) [(Job, Working)]
 
-queryPayments :: SqlPersistM [ReportPayment]
-queryPayments = do
-    js <- sqlJobs
-    let js' = map entityVal js
-    ps <- mapM (\x -> mapMaybe conv <$> sqlPaymentsForJob x) js
-    return $ zipWith ReportPayment js' ps
-  where
-    conv (p, Value (Just h)) = Just (entityVal p, h)
-    conv _ = Nothing
+data ReportJob = ReportJob
+    { reportJobJob    :: String
+    , reportJobDate   :: String
+    , reportJobHours  :: String
+    , reportJobSalary :: String
+    } deriving (Read, Show)
 
-queryWorkings :: SqlPersistM [ReportWorking]
-queryWorkings = do
-    ps <- map conv1 <$> sqlPayments
-    ws <- mapM (\x -> map conv2 <$> sqlWorkingsForPayment x) ps
-    return $ zipWith ReportWorking ps ws
-  where
-    conv1 (Value y, Value m) = (y, m)
-    conv2 (j, w) = (entityVal j, entityVal w)
+reportJobCollator :: ReportJob -> ReportJob -> Bool
+reportJobCollator (ReportJob j1 _ _ _) (ReportJob j2 _ _ _)
+  = j1 == j2
+
+data ReportPayment = ReportPayment
+    { reportPaymentPayment :: String
+    , reportPaymentDate    :: String
+    , reportPaymentJob     :: String
+    , reportPaymentHours   :: String
+    , reportPaymentSalaray :: String
+    } deriving (Read, Show)
+
+reportPaymentCollator :: ReportPayment -> ReportPayment -> Bool
+reportPaymentCollator (ReportPayment p1 _ _ _ _) (ReportPayment p2 _ _ _ _)
+  = p1 == p2
+
+data ReportTotal = ReportTotal String String
+
 
 exportAction :: IO ()
-exportAction = do
-    conn <- openDatabase
-    (ps, ms) <- run conn $ liftM2 (,) queryPayments queryWorkings
-    putStrLn . writeMarkdown def $ buildDocument ps ms
+exportAction = withDatabase $ \c -> do
+  js  <- queryReportJob c
+  js' <- queryReportJobTotal c
+  ps  <- queryReportPayment c
+  ps' <- queryReportPaymentTotal c
+  putStrLn . writeMarkdown def $ buildDocument js js' ps ps'
+  return ()
 
-sqlJobs :: SqlPersistM [Entity Job]
-sqlJobs = select $
-    from $ \job -> do
-    orderBy [asc (job ^. JobName)]
-    return $ job
+queryReportJob :: Connection -> IO [ReportJob]
+queryReportJob c = map conv <$> quickQuery' c "SELECT * FROM ReportJob" []
+  where
+    conv [a, b, c, d] = ReportJob (fromSql a) (fromSql b) (fromSql c) (fromSql d)
 
-sqlPayments :: SqlPersistM [(Value Int, Value Int)]
-sqlPayments = selectDistinct $
-    from $ \pay -> do
-    orderBy [asc (pay ^. PaymentYear), asc (pay ^.PaymentMonth)]
-    return (pay ^. PaymentYear, pay ^. PaymentMonth)
+queryReportJobTotal :: Connection -> IO [ReportTotal]
+queryReportJobTotal c = map conv <$> quickQuery' c "SELECT totalHours, totalSalary FROM ReportJobTotal" []
+  where
+    conv [a, b] = ReportTotal (fromSql a) (fromSql b)
 
-sqlPaymentsForJob :: Entity Job -> SqlPersistM [(Entity Payment, Value (Maybe Int))]
-sqlPaymentsForJob j = select $
-    from $ \(wor `InnerJoin` pay) -> do
-    on (pay ^. PaymentId ==. wor ^. WorkingPayment)
-    where_ (pay ^. PaymentJob ==. (val $ entityKey j))
-    groupBy $ pay ^. PaymentId
-    orderBy [ asc (pay ^. PaymentYear)
-            , asc (pay ^. PaymentMonth) ]
-    let hs = wor ^. WorkingEndHour -. wor ^. WorkingStartHour
-    let ms = wor ^. WorkingEndMinute -. wor ^. WorkingStartMinute
-    let duration = sum_ (hs *. val 60 -. ms)
-    return (pay, duration)
+queryReportPayment :: Connection -> IO [ReportPayment]
+queryReportPayment c = map conv <$> quickQuery' c "SELECT * FROM ReportPayment" []
+  where
+    conv [a, b, c, d, e] = ReportPayment (fromSql a) (fromSql b) (fromSql c) (fromSql d) (fromSql e)
 
-sqlWorkingsForPayment :: (Int, Int) -> SqlPersistM [(Entity Job, Entity Working)]
-sqlWorkingsForPayment (y, m) = select $
-    from $ \(wor `InnerJoin` pay `InnerJoin` job) -> do
-    on (job ^. JobId ==. pay ^. PaymentJob)
-    on (pay ^. PaymentId ==. wor ^. WorkingPayment)
-    where_ (pay ^. PaymentYear ==. val y)
-    where_ (pay ^. PaymentMonth ==. val m)
-    orderBy [ asc (wor ^. WorkingYear)
-            , asc (wor ^. WorkingMonth)
-            , asc (wor ^. WorkingDay)
-            ]
-    return (job, wor)
+queryReportPaymentTotal :: Connection -> IO [ReportTotal]
+queryReportPaymentTotal c = map conv <$> quickQuery' c "SELECT totalHours, totalSalary FROM ReportPaymentTotal" []
+  where
+    conv [a, b] = ReportTotal (fromSql a) (fromSql b)
 
-buildDocument :: [ReportPayment] -> [ReportWorking] -> Pandoc
-buildDocument ps ws = setTitle t $ doc bs
+buildDocument :: [ReportJob] -> [ReportTotal] -> [ReportPayment] -> [ReportTotal] -> Pandoc
+buildDocument js js' ps ps' = setTitle t $ doc bs
   where
     t = text "Nebenjob-Übersicht"
     bs = header 1 t
       <> header 2 (text "Abrechnungen")
-      <> mconcat (map buildPayment ps)
+      <> mconcat (zipWith buildJob (groupBy reportJobCollator js) js')
       <> header 2 (text "Arbeitsstunden")
-      <> mconcat (map buildWorking ws)
+      <> mconcat (zipWith buildPayment (groupBy reportPaymentCollator ps) ps')
 
-buildPayment :: ReportPayment -> Blocks
-buildPayment (ReportPayment j ps) = header 3 (text $ jobName j)
-                                 <> simpleTable hs rs'
+buildJob :: [ReportJob] -> ReportTotal -> Blocks
+buildJob js (ReportTotal h' s') = header 3 (text j)
+                               <> simpleTable hs rs
   where
-    hs = [ plain $ text "Abrechnung"
-         , plain $ text "Stunden"
-         , plain $ text "Gehalt"
-         ]
-    (rs, Sum s) = runWriter $ mapM (buildPaymentRows j) ps
-    lr = map (plain . text)
-        [ "Summe"
-        , printf "%.1f h" (fromIntegral s / 60 :: Double)
-        , printf "%.2f €" (fromIntegral (jobSalary j * s) / 6000 :: Double)
-        ]
-    rs' = rs ++ [lr]
+    (ReportJob j _ _ _) = head js
+    hs = map (plain . text) ["Abrechnung", "Stunden", "Gehalt"]
+    rs = map buildJobRow js
+      ++ [[ plain $ text "Summe"
+          , plain $ text h'
+          , plain $ text s'
+          ]]
 
-buildPaymentRows :: Job -> (Payment, Int) -> Writer (Sum Int) [Blocks]
-buildPaymentRows j (p, h) = do
-    tell $ Sum h
-    return $ map (plain . text) [col1, col2, col3]
+buildJobRow :: ReportJob -> [Blocks]
+buildJobRow (ReportJob _ d h s) = map (plain . text) [d, h, s]
+
+buildPayment :: [ReportPayment] -> ReportTotal -> Blocks
+buildPayment ps (ReportTotal h' s') = header 3 (text p)
+                                   <> simpleTable hs rs
   where
-    col1 = printf "%04d-%02d" (paymentYear p) (paymentMonth p)
-    col2 = printf "%.1f h" (fromIntegral h / 60 :: Double)
-    col3 = printf "%.2f €" (fromIntegral (jobSalary j * h) / 6000 :: Double)
+    (ReportPayment p _ _ _ _) = head ps
+    hs = map (plain . text) ["Datum", "Job", "Stunden", "Gehalt"]
+    rs = map buildPaymentRows ps
+      ++ [[ plain $ text "Summe"
+          , plain $ text ""
+          , plain $ text h'
+          , plain $ text s'
+          ]]
 
-buildWorking :: ReportWorking -> Blocks
-buildWorking (ReportWorking (y, m) js) = header 3 t
-                                      <> simpleTable hs rs'
-  where
-    t = text $ printf "%04d-%02d" y m
-    hs = [ plain $ text "Job"
-         , plain $ text "Datum"
-         , plain $ text "Stunden"
-         , plain $ text "Gehalt"
-         ]
-    (rs, (Sum d, Sum s)) = runWriter $ mapM buildWorkingRows js
-    lr = map (plain . text)
-        [ "Summe", ""
-        , printf "%.1f h" d
-        , printf "%.2f €" s
-        ]
-    rs' = rs ++ [lr]
-
-buildWorkingRows :: (Job, Working) -> Writer (Sum Double, Sum Double) [Blocks]
-buildWorkingRows (j, w) = do
-    tell (Sum duration, Sum salary)
-    return $ map (plain . text) [col1, col2, col3, col4]
-  where
-    start = fromIntegral (workingStartHour w * 60 + workingStartMinute w)
-    end = fromIntegral (workingEndHour w * 60 + workingEndMinute w)
-    duration = (end - start) / 60 :: Double
-    salary = duration * fromIntegral (jobSalary j) / 100
-    col1 = jobName j
-    col2 = printf "%04d-%02d-%02d" (workingYear w) (workingMonth w) (workingDay w)
-    col3 = printf "%.1f h" duration
-    col4 = printf "%.2f €" salary
-
--- vim: set ts=4 sts=4 sw=4 et:
+buildPaymentRows :: ReportPayment -> [Blocks]
+buildPaymentRows (ReportPayment _ d j h s)
+  = map (plain . text) [d, j, h, s]
