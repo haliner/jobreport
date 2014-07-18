@@ -41,7 +41,7 @@ insertPayment :: Connection -> Payment -> IO ()
 insertPayment c (Payment j y m) = void $ run c stm [toSql (jobName j), toSql y, toSql m]
   where
     stm = unlines
-      [ "INSERT INTO Payment (job, year, month)"
+      [ "INSERT OR IGNORE INTO Payment (job, year, month)"
       , "  SELECT id, ?2, ?3"
       , "  FROM   Job"
       , "  WHERE  name = ?1"
